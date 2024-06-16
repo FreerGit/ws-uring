@@ -55,6 +55,7 @@ dkms.conf
 bin/*
 build/*
 *CMakeFiles
+.cache 
 
 # Cmake files
 *.cmake
