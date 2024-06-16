@@ -18,17 +18,20 @@ function(add_files_from_directory DIR)
     endforeach()
 endfunction()
 
-# Create the library target
 add_library(ws_uring_lib "")
 
 add_files_from_directory("${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_subdirectory(domain)
-add_subdirectory(abc2)
+
+# Find liburing and wolfssl, then link against them.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBURING REQUIRED liburing)
+pkg_check_modules(WOLFSSL REQUIRED wolfssl)
 
 add_executable(main main.c)
-target_include_directories(main PRIVATE ${CMAKE_SOURCE_DIR}/include/stx/stx)
-target_link_libraries(main PRIVATE ws_uring_lib)
+target_include_directories(main PRIVATE 
+    ${CMAKE_SOURCE_DIR}/include/stx/stx ${LIBURING_INCLUDE_DIRS} ${WOLFSSL_INCLUDE_DIRS})
 
-target_link_options(main PRIVATE "-lwolfssl")
-target_link_options(main PRIVATE "-luring")
+target_link_libraries(main PRIVATE ws_uring_lib 
+    ${LIBURING_LINK_LIBRARIES} ${WOLFSSL_LINK_LIBRARIES})
