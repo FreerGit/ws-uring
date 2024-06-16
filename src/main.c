@@ -1,8 +1,8 @@
+#include <wolfssl/wolfio.h>
 #define _POSIX_C_SOURCE 200809L
 
 #define LOG_DEBUG
 #define LOG_WITH_TIME
-#define _ATFILE_SOURCE
 #include <arpa/inet.h>
 #include <bits/types/sigset_t.h>
 #include <fcntl.h>
@@ -19,15 +19,23 @@
 #include <wolfssl/ssl.h>
 
 #include "base.h"
+#include "client.h"
 #include "log.h"
 
 #define QUEUE_DEPTH 64
 #define MAX_BUFFER_SIZE 4096 * 2
 
-struct io_uring ring;
+// TODO
+typedef struct context {
+  struct client_t *client;
+  int socket;
+} context;
+
+// struct io_uring ring;
 struct io_uring_cqe *cqe;
 
 void prep_read(int fd, struct io_uring *ring, size_t max_buff_size) {
+  log_debug("%p", ring);
   struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
   if (!sqe) {
     log_fatal("could not get sqe");
@@ -44,6 +52,7 @@ void prep_read(int fd, struct io_uring *ring, size_t max_buff_size) {
 }
 
 void prep_send(int fd, struct io_uring *ring, char *buf, size_t sz) {
+  log_debug("prep_send");
   struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
   io_uring_prep_send(sqe, fd, buf, sz, 0);
   io_uring_submit(ring);
@@ -53,33 +62,25 @@ bool to_prep = true;
 
 int CbIORecv(WOLFSSL *ssl, char *buf, int sz, void *ctx) {
   (void)ssl;
-  int sockfd = *(int *)ctx;
+  //   int sockfd = *(int *)ctx;
+  struct context cc = *(context *)ctx;
+  // log_debug("%d", cc.socket);
+  // log_debug("%d", cc.client.ring.ring_fd);
   int ret = 0;
   if (to_prep) {
-    prep_read(sockfd, &ring, sz);
+    log_debug("%p", &cc.client->ring);
+    prep_read(cc.socket, &cc.client->ring, sz);
   }
   // log_info("called");
   int ret_ret;
-  ret_ret = io_uring_peek_cqe(&ring, &cqe);
+  ret_ret = io_uring_peek_cqe(&cc.client->ring, &cqe);
 
-  // while (1) {
-  //   if (ret_ret == -EAGAIN) {
-  //     // No completion yet, continue polling
-  //     continue;
-  //   } else if (ret_ret < 0) {
-  //     io_uring_queue_exit(&ring);
-  //     log_fatal("io_uring_peek_cqe: %s\n", strerror(-ret_ret));
-  //     // return 1;
-  //   } else {
-  //     break;
-  //   }
-  // }
   if (ret_ret != -EAGAIN) {
     struct iovec *data = (struct iovec *)cqe->user_data;
     memcpy(buf, data->iov_base, cqe->res);
     ret = cqe->res;
     sz = cqe->res;
-    io_uring_cqe_seen(&ring, cqe);
+    io_uring_cqe_seen(&cc.client->ring, cqe);
     to_prep = true;
   } else {
     ret = WOLFSSL_CBIO_ERR_WANT_READ;
@@ -91,12 +92,14 @@ int CbIORecv(WOLFSSL *ssl, char *buf, int sz, void *ctx) {
 
 int CbIOSend(WOLFSSL *ssl, char *buf, int sz, void *ctx) {
   (void)ssl; /* will not need ssl context, just using the file system */
-  int sockfd = *(int *)ctx;
+  //   int sockfd = *(int *)ctx;
+  struct context cc = *(context *)ctx;
+
   int sent;
   // log_debug("called send");
-  prep_send(sockfd, &ring, buf, sz);
+  prep_send(cc.socket, &cc.client->ring, buf, sz);
   int ret_ret;
-  ret_ret = io_uring_peek_cqe(&ring, &cqe);
+  ret_ret = io_uring_peek_cqe(&cc.client->ring, &cqe);
 
   // while (1) {
   //   if (ret_ret == -EAGAIN) {
@@ -112,7 +115,7 @@ int CbIOSend(WOLFSSL *ssl, char *buf, int sz, void *ctx) {
   // }
   if (ret_ret != -EAGAIN) {
     sent = cqe->res;
-    io_uring_cqe_seen(&ring, cqe);
+    io_uring_cqe_seen(&cc.client->ring, cqe);
   } else {
     sent = 0;
   }
@@ -134,16 +137,13 @@ FN_PURE int set_socket_nonblocking(int sockfd) {
 }
 
 int main() {
-  struct io_uring_params params;
-  memset(&params, 0, sizeof(params));
-  // params.flags = IORING_SETUP_IOPOLL;
+  struct client_t client = {};
+  log_debug("%p", &client.ring);
 
-  // Set up liburing 2.5
-  if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
-    perror("io_uring_queue_init");
-    return -1;
+  int err_code = init_uring(&client, 1024 * 8);
+  if (UNLIKELY(err_code != 0)) {
+    log_error("%s", get_client_error(err_code));
   }
-
   // Initialize WolfSSL
   wolfSSL_Init();
 
@@ -174,10 +174,10 @@ int main() {
   }
 
   // Prepare the connect operation
-  struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&client.ring);
   if (!sqe) {
     log_error("io_uring_get_sqe: queue is full\n");
-    io_uring_queue_exit(&ring);
+    io_uring_queue_exit(&client.ring);
     close(sockfd);
     return 1;
   }
@@ -185,10 +185,10 @@ int main() {
                         sizeof(server_addr));
 
   // Submit the request
-  int conn_ret = io_uring_submit(&ring);
+  int conn_ret = io_uring_submit(&client.ring);
   if (conn_ret < 0) {
     log_error("io_uring_submit: %d\n", -conn_ret);
-    io_uring_queue_exit(&ring);
+    io_uring_queue_exit(&client.ring);
     close(sockfd);
     return 1;
   }
@@ -196,13 +196,13 @@ int main() {
   ulong ns = TIME_A_BLOCK_NS({
     // Poll for completion
     while (1) {
-      conn_ret = io_uring_peek_cqe(&ring, &cqe);
+      conn_ret = io_uring_peek_cqe(&client.ring, &cqe);
       if (conn_ret == -EAGAIN) {
         // No completion yet, continue polling
         continue;
       } else if (conn_ret < 0) {
         fprintf(stderr, "io_uring_peek_cqe: %s\n", strerror(-conn_ret));
-        io_uring_queue_exit(&ring);
+        io_uring_queue_exit(&client.ring);
         close(sockfd);
         return 1;
       } else {
@@ -214,13 +214,13 @@ int main() {
   // Process the completion
   if (cqe->res < 0) {
     fprintf(stderr, "Async connect failed: %s\n", strerror(-cqe->res));
-    io_uring_queue_exit(&ring);
+    io_uring_queue_exit(&client.ring);
     close(sockfd);
     return 1;
   }
   log_info("Socket connection took %ld ns", ns);
 
-  io_uring_cqe_seen(&ring, cqe);
+  io_uring_cqe_seen(&client.ring, cqe);
 
   // Create a WolfSSL object
   wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
@@ -231,8 +231,14 @@ int main() {
   }
 
   // Attach the socket to the WolfSSL object
-  wolfSSL_set_fd(ssl, sockfd);
+  // TODO
 
+  struct context my_ctx = {&client, sockfd};
+
+  //   wolfSSL_set_fd(ssl, sockfd);
+  wolfSSL_SetIOReadCtx(ssl, &my_ctx);
+  wolfSSL_SetIOWriteCtx(ssl, &my_ctx);
+  // TODO
   int ret;
 
   ns = TIME_A_BLOCK_NS({
@@ -294,7 +300,7 @@ int main() {
 
   log_info("read in %ld ns, \n%s", ns, buff);
 
-  io_uring_queue_exit(&ring);
+  io_uring_queue_exit(&client.ring);
   wolfSSL_free(ssl);
   wolfSSL_CTX_free(ctx);
   wolfSSL_Cleanup();

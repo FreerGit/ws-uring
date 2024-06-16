@@ -47,4 +47,5 @@ int main() {
                     : "\x1B[32mUnit Tests Successful",
              global_total_tests - global_failed_tests, global_total_tests);
   }
+  return 0;
 }
