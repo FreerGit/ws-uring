@@ -21,9 +21,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    b.installArtifact(exe);
+    exe.linkLibC();
+    exe.linkSystemLibrary("wolfssl");
 
-    exe.linkSystemLibrary2("wolfssl", .{ .preferred_link_mode = .static });
+    b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
 
