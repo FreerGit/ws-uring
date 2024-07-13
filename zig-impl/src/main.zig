@@ -9,13 +9,13 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 pub fn main() !void {
     print("{s}", .{"hello world"});
     var client = try Client.init(2);
-    const begin = std.time.milliTimestamp();
+    const begin = std.time.microTimestamp();
     while (true) {
         const connected = try Client.connect(&client, "wss://stream.bybit.com/smtg");
         print("{}", .{connected});
         if (connected) break;
     }
-    const end = std.time.milliTimestamp();
+    const end = std.time.microTimestamp();
     print("{d}", .{end - begin});
 }
 
