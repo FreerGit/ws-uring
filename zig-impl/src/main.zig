@@ -7,12 +7,10 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn main() !void {
-    print("{s}", .{"hello world"});
-    var client = try Client.init(2);
+    var client = try Client.init(.{}, 2);
     const begin = std.time.microTimestamp();
     while (true) {
-        const connected = try Client.connect(&client, "wss://stream.bybit.com/smtg");
-        print("{}", .{connected});
+        const connected = try Client.connect(&client, "https://www.example.com");
         if (connected) break;
     }
     const end = std.time.microTimestamp();
