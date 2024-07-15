@@ -7,7 +7,8 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn main() !void {
-    var client = try Client.init(.{}, 2);
+    var client = try Client.init(.{ .tls = true, .blocking = true }, 2);
+    print("{}", .{client});
     const begin = std.time.microTimestamp();
     while (true) {
         const connected = try Client.connect(&client, "https://www.example.com");
