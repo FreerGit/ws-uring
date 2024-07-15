@@ -7,11 +7,12 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn main() !void {
-    var client = try Client.init(.{ .tls = true, .blocking = true }, 2);
+    const allo = std.heap.c_allocator;
+    const client = try Client.init(allo, .{ .tls = true, .blocking = true }, 2);
     print("{}", .{client});
     const begin = std.time.microTimestamp();
     while (true) {
-        const connected = try Client.connect(&client, "https://www.example.com");
+        const connected = try Client.connect(client, "https://www.example.com");
         if (connected) break;
     }
     const end = std.time.microTimestamp();

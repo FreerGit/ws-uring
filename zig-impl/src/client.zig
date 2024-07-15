@@ -3,11 +3,12 @@ const IoUring = std.os.linux.IoUring;
 const ffi = @import("c.zig");
 const linux = std.os.linux;
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 
 const ClientFSM = enum { Idle, IsConnecting, IsUpgradingTLS, IssueRead, IsReading };
 
 const Context = struct {
-    allr: std.mem.Allocator,
+    allo: std.mem.Allocator,
     uring: IoUring,
     sockfd: linux.fd_t,
     state: ClientFSM,
@@ -24,21 +25,25 @@ context: Context,
 ssl: ?*ffi.WOLFSSL,
 wolfssl_ctx: ?*ffi.WOLFSSL_CTX, // TODO naming, this may not be required.
 
-pub fn init(comptime settings: ClientSettings, queue_depth: u16) !Client {
+// Caller owns the memory, the allocator will be used for reading. If you're using
+// static backed memory, make sure there is an reasonable amount. All functions (including init)
+// may OOM.
+pub fn init(allo: Allocator, comptime settings: ClientSettings, queue_depth: u16) !*Client {
     // const uring =
     // const sockfd = ;
-    var client = Client{
+    const client = try allo.create(Client);
+    client.* = Client{
         .settings = settings,
         .ssl = null, // this is set below in wolfSSLInit
         .wolfssl_ctx = null, // this is set below in wolfSSLInit
         .context = .{
-            .allr = std.heap.raw_c_allocator, // TODO
+            .allo = allo, // TODO
             .state = ClientFSM.Idle,
             .uring = try IoUring.init(queue_depth, 0),
             .sockfd = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, linux.IPPROTO.TCP)),
         },
     };
-    try wolfSSLInit(&client); // TODO only if wss
+    try wolfSSLInit(client); // TODO only if wss
     return client;
 }
 
@@ -52,7 +57,7 @@ pub fn connect(cc: *Client, url: []const u8) !bool {
             // and directly return it to user.
             // assert(std.mem.eql(u8, uri.scheme, "wss")); // Only TLS is accepted
 
-            const addresses = try std.net.getAddressList(cc.context.allr, uri.host.?.percent_encoded, 443);
+            const addresses = try std.net.getAddressList(cc.context.allo, uri.host.?.percent_encoded, 443);
             defer addresses.deinit();
             const ipv4 = addresses.addrs[0];
             const sqe = try cc.context.uring.get_sqe();
@@ -83,8 +88,9 @@ pub fn connect(cc: *Client, url: []const u8) !bool {
             std.debug.print("{}\n", .{cc});
             std.debug.print("{?} {?}\n", .{ cc.ssl, cc.wolfssl_ctx });
             const ret = ffi.wolfSSL_connect(cc.ssl);
-            std.debug.print("ERR CODE: {}\n", .{ffi.wolfSSL_get_error(cc.ssl, ret)});
-            switch (ret) {
+            const opcode = ffi.wolfSSL_get_error(cc.ssl, ret);
+            std.debug.print("ERR CODE: {}\n", .{opcode});
+            switch (opcode) {
                 ffi.SSL_SUCCESS => return true,
                 ffi.SSL_ERROR_WANT_READ, ffi.SSL_ERROR_WANT_WRITE => return false,
                 else => {
@@ -153,37 +159,34 @@ fn recvCallback(ssl: ?*ffi.WOLFSSL, buf: [*c]u8, sz: c_int, ctx: ?*anyopaque) ca
 
 fn clientPrepRead(cc: *Client, sz: c_int) !void {
     const sqe = try IoUring.get_sqe(&cc.context.uring);
-    const buf = try cc.context.allr.alloc(u8, @intCast(sz));
+    const buf = try cc.context.allo.alloc(u8, @intCast(sz));
     sqe.prep_read(cc.context.sockfd, buf, 0);
     const s = try cc.context.uring.submit();
     assert(s >= 0);
 }
 
 fn sendCallback(ssl: ?*ffi.WOLFSSL, buf: [*c]u8, sz: c_int, ctx: ?*anyopaque) callconv(.C) c_int {
-    _ = sz; // autofix
-    _ = buf; // autofix
-    std.debug.print("in send callback {?}\n", .{ssl});
+    _ = ssl; // autofix
     const context: *Context = @ptrCast(@alignCast(ctx));
-    std.debug.print("callback {}\n", .{context.uring});
-    assert(false);
-    return 0;
-    // clientPrepSend(context, buf, sz) catch |err| {
-    //     // TODO
-    //     std.debug.print("{}", .{err});
-    //     assert(false);
-    // };
-    // const completed = context.uring.cq_ready();
-    // if (completed > 0) {
-    //     const cqe = peek_cqe(&context.uring) catch |err| blk: {
-    //         std.debug.print("{}", .{err});
-    //         assert(false);
-    //         break :blk null;
-    //     };
-    //     return cqe.?.res;
-    // } else {
-    //     assert(completed == 0);
-    //     return 0;
-    // }
+    std.debug.print("callback {}\n", .{context.sockfd});
+
+    clientPrepSend(context, buf, sz) catch |err| {
+        // TODO
+        std.debug.print("{}", .{err});
+        assert(false);
+    };
+    const completed = context.uring.cq_ready();
+    if (completed > 0) {
+        const cqe = peek_cqe(&context.uring) catch |err| blk: {
+            std.debug.print("{}", .{err});
+            assert(false);
+            break :blk null;
+        };
+        return cqe.?.res;
+    } else {
+        assert(completed == 0);
+        return 0;
+    }
 }
 
 fn clientPrepSend(ctx: *Context, buf: [*c]u8, sz: c_int) !void {
