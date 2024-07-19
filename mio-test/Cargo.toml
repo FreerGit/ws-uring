@@ -7,5 +7,12 @@ edition = "2021"
 
 [dependencies]
 mio = { version = "0.8", features = ["os-poll", "net"]}
-rustls = "0.20"
-webpki-roots = "0.22"
+io-uring = "0.6.1"
+rustls = "0.23.11"
+webpki-roots = "0.26.3"
+libc = "0.2"
+os_socketaddr = "0.2.5"
+
+# TODO
+[profile.release]
+debug = true

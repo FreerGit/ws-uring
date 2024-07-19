@@ -32,6 +32,10 @@ pub fn init(allo: Allocator, comptime settings: ClientSettings, queue_depth: u16
     // const uring =
     // const sockfd = ;
     const client = try allo.create(Client);
+    const begin = std.time.nanoTimestamp();
+    const sockfd: i32 = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, linux.IPPROTO.TCP));
+    const end = std.time.nanoTimestamp();
+    std.debug.print("{}\n", .{end - begin});
     client.* = Client{
         .settings = settings,
         .ssl = null, // this is set below in wolfSSLInit
@@ -40,7 +44,7 @@ pub fn init(allo: Allocator, comptime settings: ClientSettings, queue_depth: u16
             .allo = allo, // TODO
             .state = ClientFSM.Idle,
             .uring = try IoUring.init(queue_depth, 0),
-            .sockfd = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, linux.IPPROTO.TCP)),
+            .sockfd = sockfd,
         },
     };
     try wolfSSLInit(client); // TODO only if wss
