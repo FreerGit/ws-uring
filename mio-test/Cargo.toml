@@ -1,17 +1,16 @@
 [package]
-name = "mio-test"
+name = "ws_uring"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-mio = { version = "0.8", features = ["os-poll", "net"]}
 io-uring = "0.6.1"
 rustls = "0.23.11"
 webpki-roots = "0.26.3"
 libc = "0.2"
 os_socketaddr = "0.2.5"
+thiserror = "1.0.63"
+url = "2.5.2"
 
 # TODO
 [profile.release]

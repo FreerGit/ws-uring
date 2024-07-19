@@ -1,9 +1,10 @@
 // #![feature(io_uring)]
 
+use ws_uring::client::{self, Client};
+
 use io_uring::squeue::Entry;
 use io_uring::types::Fd;
 use io_uring::{opcode, types, IoUring, SubmissionQueue};
-use mio::net::TcpStream;
 use os_socketaddr::OsSocketAddr;
 use rustls::StreamOwned;
 use std::io::{self, Read, Write};
@@ -18,27 +19,32 @@ const BUFFER_SIZE: usize = 4096;
 
 fn main() -> io::Result<()> {
     // TODO this blocks.
-    let addr = "example.com:443".to_socket_addrs()?.next().unwrap();
-    let os_addr: OsSocketAddr = addr.into();
-    // libc::sockaddr::into(addr);
-    let outer_b = std::time::Instant::now();
+    // let addr = "example.com:443".to_socket_addrs()?.next().unwrap();
+    // let os_addr: OsSocketAddr = addr.into();
+    // // libc::sockaddr::into(addr);
+    // let outer_b = std::time::Instant::now();
 
-    // SocketAddrV4::
+    // // SocketAddrV4::
 
-    // TODO user spec.
-    let mut ring = IoUring::new(32).unwrap();
+    // // TODO user spec.
+    // let mut ring = IoUring::new(32).unwrap();
 
-    let mut sq = IoUring::submission(&mut ring);
+    // let mut sq = IoUring::submission(&mut ring);
 
-    let sockfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
-    // io_uring::
-    let prep_connect =
-        opcode::Connect::new(Fd(sockfd.as_raw_fd()), os_addr.as_ptr(), os_addr.len());
+    // let sockfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
+    // // io_uring::
+    // let prep_connect =
+    //     opcode::Connect::new(Fd(sockfd.as_raw_fd()), os_addr.as_ptr(), os_addr.len());
 
-    unsafe { sq.push(&prep_connect.build()).unwrap() };
+    // unsafe { sq.push(&prep_connect.build()).unwrap() };
 
-    let outer_e = std::time::Instant::now();
-    println!("{:?} ", outer_e - outer_b);
+    // let outer_e = std::time::Instant::now();
+    // println!("{:?} ", outer_e - outer_b);
+
+    let mut client = Client::new();
+    let addr = client.dns_lookup("google.com", 80).unwrap();
+    let state = client.connect(addr);
+    println!("{:?}", state);
     Ok(())
 }
 
