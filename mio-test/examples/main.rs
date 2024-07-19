@@ -1,6 +1,6 @@
 // #![feature(io_uring)]
 
-use ws_uring::client::{self, Client};
+use ws_uring::client::{self, Client, ConnectState};
 
 use io_uring::squeue::Entry;
 use io_uring::types::Fd;
@@ -41,10 +41,18 @@ fn main() -> io::Result<()> {
     // let outer_e = std::time::Instant::now();
     // println!("{:?} ", outer_e - outer_b);
 
-    let mut client = Client::new();
+    let mut client = Client::new(true);
     let addr = client.dns_lookup("google.com", 80).unwrap();
-    let state = client.connect(addr);
-    println!("{:?}", state);
+    loop {
+        let begin = std::time::Instant::now();
+        let state = client.connect(addr);
+        let end = std::time::Instant::now();
+        println!("{:?} {:?}", end - begin, state);
+        // println!("{:?}", state);
+        if let Ok(ConnectState::Connected) = state {
+            break;
+        }
+    }
     Ok(())
 }
 

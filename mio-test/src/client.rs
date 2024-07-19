@@ -1,16 +1,17 @@
 use std::{net::ToSocketAddrs, os::fd::AsRawFd};
 
 use io_uring::{
-    opcode::{self, Connect},
+    opcode::{self},
     types::Fd,
     IoUring,
 };
-use libc::sockaddr;
 use os_socketaddr::OsSocketAddr;
 use thiserror::Error;
 
 pub struct Client {
     ring: IoUring,
+    tls: bool,
+    conn_state: ConnectState,
 }
 
 type Result<T> = std::result::Result<T, ClientError>;
@@ -25,17 +26,20 @@ pub enum ClientError {
     DNSLookupError(&'static str),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ConnectState {
     Connecting,
     Connected,
+    Idle,
 }
 
 impl Client {
-    pub fn new() -> Client {
+    pub fn new(tls: bool) -> Client {
         // TODO user definable `entries`?
         return Client {
             ring: IoUring::new(32).unwrap(),
+            tls,
+            conn_state: ConnectState::Idle,
         };
     }
     // TODO docs
@@ -66,21 +70,33 @@ impl Client {
 
     // TODO docs
     pub fn connect(&mut self, addr: OsSocketAddr) -> Result<ConnectState> {
-        let mut sq = IoUring::submission(&mut self.ring);
-        // TODO no-delay?
-        let sockfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
-        let prep_connect = opcode::Connect::new(Fd(sockfd.as_raw_fd()), addr.as_ptr(), addr.len());
-        unsafe { sq.push(&prep_connect.build()).unwrap() };
-        return Ok(ConnectState::Connected);
+        if self.conn_state == ConnectState::Idle {
+            // TODO no-delay?
+            let sockfd =
+                unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
+            let prep_connect =
+                opcode::Connect::new(Fd(sockfd.as_raw_fd()), addr.as_ptr(), addr.len());
+            unsafe { self.ring.submission().push(&prep_connect.build()).unwrap() };
+            self.ring.submit().unwrap();
+            self.conn_state = ConnectState::Connecting;
+        }
+
+        let mut peekable_cq = self.ring.completion().peekable();
+        if let Some(_) = peekable_cq.peek() {
+            self.conn_state = ConnectState::Connected;
+        }
+        return Ok(self.conn_state);
     }
 }
+
+// fn prep_connect
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn dns_lookup() {
-        let client = Client::new();
+        let client = Client::new(false);
         let mut ip = client.dns_lookup("google.com", 80);
         assert!(ip.is_ok());
         ip = client.dns_lookup("example.com", 443);
