@@ -41,14 +41,13 @@ fn main() -> io::Result<()> {
     // let outer_e = std::time::Instant::now();
     // println!("{:?} ", outer_e - outer_b);
 
-    let mut client = Client::new(true);
-    let addr = client.dns_lookup("google.com", 80).unwrap();
+    let addr = ws_uring::client::dns_lookup("example.com", 80).unwrap();
+    let mut client = Client::new(addr, true);
     loop {
         let begin = std::time::Instant::now();
-        let state = client.connect(addr);
+        let state = client.connect();
         let end = std::time::Instant::now();
-        println!("{:?} {:?}", end - begin, state);
-        // println!("{:?}", state);
+        // println!("{:?} {:?}", end - begin, state);
         if let Ok(ConnectState::Connected) = state {
             break;
         }
@@ -56,144 +55,112 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-// let root_store =
-//     rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-// let config = rustls::ClientConfig::builder()
-//     .with_root_certificates(root_store)
-//     .with_no_client_auth();
-
-// let server_name = "example.com".try_into().unwrap();
-// let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
-// // let mut tls_stream = StreamOwned::new(conn, stream);
-
-// // Prepare the GET request
-// let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-// let mut write_buffer = request.to_vec();
-
-// // Set up io_uring
-// let mut ring = IoUring::new(8)?;
-
-// let mut read_buffer = vec![0u8; BUFFER_SIZE];
-// // let mut response = Vec::new();
-
-// // unsafe { ring.submission().push(opcode::Connect) };
-
-// ##########################
-
-// use mio::net::TcpStream;
-// use mio::Token;
-// use rustls::ClientConfig;
-// use rustls::OwnedTrustAnchor;
-// use rustls::RootCertStore;
-// use rustls::ServerName;
-// use rustls::Stream;
-// use std::io::{Read, Write};
-// use std::net::SocketAddr;
-// use std::sync::Arc;
-// use std::time;
-
-// // const SERVER: Token = Token(0);
-
 // fn main() -> Result<(), Box<dyn std::error::Error>> {
-// // Create a root certificate store
-// let mut root_cert_store = RootCertStore::empty();
-// root_cert_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-//     OwnedTrustAnchor::from_subject_spki_name_constraints(
-//         ta.subject,
-//         ta.spki,
-//         ta.name_constraints,
-//     )
-// }));
+//     // Assume you have a connected socket
+//     let mut socket = TcpStream::connect("example.com:443")?;
+//     socket.set_nonblocking(true)?;
 
-// // Create a rustls client config
-// let config = ClientConfig::builder()
-//     .with_safe_defaults()
-//     .with_root_certificates(root_cert_store)
-//     .with_no_client_auth();
+//     // Set up rustls
+//     let mut root_store = rustls::RootCertStore::empty();
+//     root_store.add_server_trust_anchors(&TLS_SERVER_ROOTS);
+//     let config = ClientConfig::builder()
+//         .with_safe_defaults()
+//         .with_root_certificates(root_store)
+//         .with_no_client_auth();
+//     let config = Arc::new(config);
+//     let server_name = ServerName::try_from("example.com")?;
+//     let mut conn = ClientConnection::new(config, server_name)?;
 
-// // Wrap it in an Arc
-// let config = Arc::new(config);
+//     // Create an IoUring instance
+//     let mut ring = IoUring::new(256)?;
 
-// let mut begin = time::Instant::now();
+//     // Buffer to read/write data
+//     let mut read_buf = [0; 4096];
+//     let mut write_buf = Vec::new();
 
-// // Create a DNS name for the server
-// let dns_name = ServerName::try_from("google.com").unwrap();
-
-// // Create a TcpStream and set it to non-blocking
-// let addr: SocketAddr = "142.250.74.174:443".parse().unwrap(); // example.com IP
-
-// // TODO blocks
-// let mut stream = TcpStream::connect(addr)?;
-
-// // stream.
-// // stream.set_nonblocking(true)?;
-// // stream.set
-
-// // Create a Poll instance
-// // let mut poll = Poll::new()?;
-// // poll.registry()
-// //     .register(&mut stream, SERVER, Interest::READABLE | Interest::WRITABLE)?;
-
-// // Create a buffer for handling events
-// // let mut events = Events::with_capacity(128);
-
-// // Create a client session
-// let mut client = rustls::ClientConnection::new(config, dns_name)?;
-// let mut tls_stream = Stream::new(&mut client, &mut stream);
-
-// let mut end = time::Instant::now();
-// print!("handshake {:?}\n", end - begin);
-
-// begin = time::Instant::now();
-
-// // Handshake loop
-// 'outer: loop {
-//     // poll.poll(&mut events, None)?;
-
-//     match tls_stream.conn.complete_io(tls_stream.sock) {
-//         Ok(_) => {
-//             println!("TLS handshake completed");
-//             break 'outer;
+//     // Perform the TLS handshake
+//     loop {
+//         // Read data from socket and feed it to the TLS connection
+//         let read_e = opcode::Read::new(types::Fd(socket.as_raw_fd()), read_buf.as_mut_ptr(), read_buf.len() as _)
+//             .build()
+//             .user_data(0x01);
+//         unsafe {
+//             ring.submission().push(&read_e).expect("submission queue is full");
 //         }
-//         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-//         Err(e) => return Err(Box::new(e)),
+//         ring.submit_and_wait(1)?;
+
+//         let cqe = ring.completion().next().expect("completion queue is empty");
+//         if cqe.result() > 0 {
+//             let n = cqe.result() as usize;
+//             let mut tls_stream = StreamOwned::new(conn, socket);
+//             tls_stream.read_tls(&mut &read_buf[..n])?;
+//             tls_stream.process_new_packets()?;
+//         }
+
+//         // Write data from the TLS connection to the socket
+//         if conn.wants_write() {
+//             write_buf.clear();
+//             conn.write_tls(&mut write_buf)?;
+//             let write_e = opcode::Write::new(types::Fd(socket.as_raw_fd()), write_buf.as_ptr(), write_buf.len() as _)
+//                 .build()
+//                 .user_data(0x02);
+//             unsafe {
+//                 ring.submission().push(&write_e).expect("submission queue is full");
+//             }
+//             ring.submit_and_wait(1)?;
+
+//             let cqe = ring.completion().next().expect("completion queue is empty");
+//             if cqe.result() < 0 {
+//                 return Err(std::io::Error::from_raw_os_error(-cqe.result()).into());
+//             }
+//         }
+
+//         // Check if the handshake is complete
+//         if !conn.is_handshaking() {
+//             break;
+//         }
 //     }
-// }
 
-// end = time::Instant::now();
-// print!("TLS handshake {:?}\n", end - begin);
-
-// // Send a request
-// tls_stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
-// println!("Sent requestx");
-
-// begin = time::Instant::now();
-
-// let mut buf = [0; 4096];
-// let mut x = 0;
-// 'outer: loop {
-//     // poll.poll(&mut events, None)?;
-
-//     // for event in events.iter() {
-//     // if event.token() == SERVER && event.is_readable() {
-//     match tls_stream.read(&mut buf) {
-//         Ok(0) => {
-//             println!("Connection closed");
-//             break 'outer;
-//         }
-//         Ok(m) => {
-//             x = m;
-//             break 'outer;
-//         }
-//         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-//         Err(e) => return Err(Box::new(e)),
+//     // Now you have a TLS connection, you can proceed with normal I/O operations
+//     // Example: Reading data using io_uring
+//     let mut buf = [0; 4096];
+//     let read_e = opcode::Read::new(types::Fd(socket.as_raw_fd()), buf.as_mut_ptr(), buf.len() as _)
+//         .build()
+//         .user_data(0x03);
+//     unsafe {
+//         ring.submission().push(&read_e).expect("submission queue is full");
 //     }
-// }
-// // }
-// // }
-// end = time::Instant::now();
-// print!("{:?}\n", end - begin);
-// print!("{:?}\n", std::str::from_utf8(&buf[..x]).unwrap());
-// return Ok(());
+//     ring.submit_and_wait(1)?;
+
+//     let cqe = ring.completion().next().expect("completion queue is empty");
+//     if cqe.user_data() == 0x03 {
+//         let n = cqe.result();
+//         if n > 0 {
+//             println!("Read {} bytes", n);
+//         } else {
+//             eprintln!("Read error: {}", n);
+//         }
+//     }
+
+//     // Example: Writing data using io_uring
+//     let write_data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+//     let write_e = opcode::Write::new(types::Fd(socket.as_raw_fd()), write_data.as_ptr(), write_data.len() as _)
+//         .build()
+//         .user_data(0x04);
+//     unsafe {
+//         ring.submission().push(&write_e).expect("submission queue is full");
+//     }
+//     ring.submit_and_wait(1)?;
+
+//     let cqe = ring.completion().next().expect("completion queue is empty");
+//     if cqe.user_data() == 0x04 {
+//         let n = cqe.result();
+//         if n > 0 {
+//             println!("Wrote {} bytes", n);
+//         } else {
+//             eprintln!("Write error: {}", n);
+//         }
+//     }
+
+//     Ok(())
 // }
