@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     io::{self, ErrorKind, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     os::fd::{AsRawFd, FromRawFd},
@@ -8,7 +9,7 @@ use std::{
 use io_uring::{
     opcode::{self},
     types::Fd,
-    IoUring,
+    CompletionQueue, IoUring,
 };
 use os_socketaddr::OsSocketAddr;
 use rustls::{pki_types::ServerName, ClientConnection, RootCertStore, StreamOwned};
@@ -20,12 +21,8 @@ pub struct Client {
     addr: OsSocketAddr,
     domain: String,
     sockfd: i32,
-    conn_state: ConnectState,
-    read_submitted: bool,
-    write_submitted: bool,
     tls: Option<TlsStream>,
-    tls_buffer: Vec<u8>,
-    // wb: Vec<u8>,
+    tls_buffer: Vec<u8>, // TODO optional
 }
 
 type TlsStream = StreamOwned<ClientConnection, TcpStream>;
@@ -50,11 +47,9 @@ pub enum ClientError {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ConnectState {
+    Disconnected,
     Connecting,
     Connected,
-    TlsHandshakeInit,
-    TlsHandshakeRead,
-    Idle,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -69,6 +64,13 @@ pub enum WriteState {
     Disconnected,
     WantsWrite,
     Written,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum OperationType {
+    Read,
+    Write,
+    Connect,
 }
 
 impl Client {
@@ -101,9 +103,6 @@ impl Client {
         // TODO user definable `entries`?
         return Ok(Client {
             ring: IoUring::new(32).unwrap(),
-            conn_state: ConnectState::Idle,
-            read_submitted: false,
-            write_submitted: false,
             addr,
             domain,
             tls: tls_ctx,
@@ -113,276 +112,210 @@ impl Client {
     }
 
     // TODO docs
-    pub fn connect(&mut self) -> Result<ConnectState> {
-        if self.conn_state == ConnectState::Idle {
-            // TODO no-delay?
+    // pub fn connect(&mut self) -> Result<ConnectState> {
+    //     // assert!(self.tls.is_some());
 
-            let prep_connect = opcode::Connect::new(
-                Fd(self.sockfd.as_raw_fd()),
-                self.addr.as_ptr(),
-                self.addr.len(),
-            );
-            unsafe { self.ring.submission().push(&prep_connect.build()).unwrap() };
-            self.ring.submit().unwrap();
-            self.conn_state = ConnectState::Connecting;
-        }
+    //     if !self.connect_submitted {
+    //         let prep_connect = opcode::Connect::new(
+    //             Fd(self.sockfd.as_raw_fd()),
+    //             self.addr.as_ptr(),
+    //             self.addr.len(),
+    //         );
+    //         unsafe {
+    //             self.ring
+    //                 .submission()
+    //                 .push(
+    //                     &prep_connect
+    //                         .build()
+    //                         .user_data(Box::into_raw(Box::new(OperationType::Connect)) as u64),
+    //                 )
+    //                 .expect("submission queue is full")
+    //         };
+    //         self.ring.submit().unwrap();
+    //         self.connect_submitted = true; // todo set false when connect is done.
+    //     }
+    //     let a = self.ring.completion().len();
+    //     println!("before {:?}", a);
+    //     match get_cqe_by_op(self.ring.completion(), OperationType::Connect) {
+    //         _ => {
+    //             if self.tls.is_none() {
+    //                 return Ok(ConnectState::Connected);
+    //             }
+    //         }
+    //     }
+    //     let b = self.ring.completion().len();
+    //     println!("after {:?}", b);
+    //     if a > 10 {
+    //         panic!();
+    //     }
+    //     // let conn = &self. .tls.as_ref().unwrap().conn;
+    //     // if !self.tls.as_ref().unwrap().conn.is_handshaking() {
+    //     //     return Ok(ConnectState::Connected);
+    //     // }
 
-        if self.conn_state == ConnectState::TlsHandshakeInit {
-            // let read_e = opcode::Read::new(
-            //     Fd(self.tls.unwrap().get_ref().as_raw_fd()),
-            //     // self.tls.unwrap().sock.
-            //     self.rb.as_mut_ptr(),
-            //     self.rb.len() as _,
-            // );
-            // unsafe {
-            //     self.ring
-            //         .submission()
-            //         .push(&read_e.build())
-            //         .expect("SQ is full")
-            // }
-            // self.ring.submit().unwrap();
-            self.conn_state = ConnectState::TlsHandshakeRead;
-        }
+    //     if self.tls.as_ref().unwrap().conn.wants_write() {
+    //         // println!("wants write");
+    //         let mut write_buffer = vec![0u8; 16384];
+    //         match self.write(&mut write_buffer) {
+    //             Ok(WriteState::Written) => {}
+    //             Ok(WriteState::WantsWrite) => {}
+    //             Ok(WriteState::Disconnected) => return Ok(ConnectState::Disconnected),
+    //             Err(e) => return Err(e),
+    //         }
+    //     }
 
-        // TODO just check len instead.
-        // let mut peekable_cq = self.ring.completion().peekable();
-        if self.ring.completion().len() > 0 {
-            // Has to hold true since we peeked it, if not there is certainly a bug.
-            match self.conn_state {
-                ConnectState::Connecting => {
-                    if let Some(_) = self.tls {
-                        self.conn_state = ConnectState::TlsHandshakeRead;
-                    } else {
-                        let _ = self.ring.completion().next().unwrap(); // advance the cq
-                        self.conn_state = ConnectState::Connected;
-                    }
-                }
-                ConnectState::TlsHandshakeRead => {
-                    let _ = self.ring.completion().next().unwrap(); // advance the cq
-                                                                    // ;
-                    let mut read_buf = vec![0u8; 16384];
-                    let mut write_buf = vec![0u8; 16384];
-                    let conn = &mut self.tls.as_mut().unwrap().conn;
-                    while conn.is_handshaking() {
-                        // panic!("hejs");
-                        // Try to progress the handshake
-                        if conn.wants_write() {
-                            match conn.write_tls(&mut &mut write_buf[..]) {
-                                Ok(written) => {
-                                    if written > 0 {
-                                        let write_op = opcode::Write::new(
-                                            Fd(self.sockfd.as_raw_fd()),
-                                            write_buf.as_ptr(),
-                                            written as _,
-                                        )
-                                        .build();
-                                        unsafe {
-                                            self.ring
-                                                .submission()
-                                                .push(&write_op)
-                                                .expect("submission queue is full");
-                                        }
-                                        self.ring.submit_and_wait(1).unwrap();
-                                        // Process completion
-                                        self.ring.completion().for_each(|cqe| {
-                                            let res = cqe.result();
-                                            if res < 0 {
-                                                eprintln!(
-                                                    "Write failed: {}",
-                                                    io::Error::from_raw_os_error(-res)
-                                                );
-                                            }
-                                        });
-                                    }
-                                }
-                                // Err(WantWrite) => {}
-                                Err(e) => panic!("{}", format!("{:?}", e)),
-                            }
-                        }
+    //     if self.tls.as_ref().unwrap().conn.wants_read() {
+    //         // println!("wants read");
 
-                        if conn.wants_read() {
-                            let read_op = opcode::Read::new(
-                                Fd(self.sockfd.as_raw_fd()),
-                                read_buf.as_mut_ptr(),
-                                read_buf.len() as _,
-                            )
-                            .build();
-                            unsafe {
-                                self.ring
-                                    .submission()
-                                    .push(&read_op)
-                                    .expect("submission queue is full");
-                            }
-                            self.ring.submit_and_wait(1).unwrap();
+    //         let mut read_buffer = vec![0u8; 16384];
+    //         match self.read(&mut read_buffer) {
+    //             Ok(ReadState::Read(_)) => {}
+    //             Ok(ReadState::WantsRead) => {}
+    //             Ok(ReadState::Disconnected) => return Ok(ConnectState::Disconnected),
+    //             Err(e) => return Err(e),
+    //         }
+    //     }
+    //     // TODO .next the connect cqe
 
-                            let mut bytes_read = 0;
-                            self.ring.completion().for_each(|cqe| {
-                                let res = cqe.result();
-                                if res >= 0 {
-                                    bytes_read = res as usize;
-                                } else {
-                                    eprintln!(
-                                        "Read failed: {}",
-                                        io::Error::from_raw_os_error(-res)
-                                    );
-                                }
-                            });
+    //     return Ok(ConnectState::Connecting);
+    // }
 
-                            if bytes_read > 0 {
-                                match conn.read_tls(&mut &read_buf[..bytes_read]) {
-                                    Ok(_) => {
-                                        if let Err(e) = conn.process_new_packets() {
-                                            panic!("{}", format!("{:?}", e));
-                                        }
-                                    }
-                                    // Err(WantRead) => {}
-                                    Err(e) => panic!("{}", format!("{:?}", e)),
-                                }
-                            }
-                        }
-                    }
-                    // panic!("hej");
-                    return Ok(ConnectState::Connected);
-                }
-                ConnectState::TlsHandshakeInit | ConnectState::Idle | ConnectState::Connected => {
-                    todo!()
-                }
-            }
-        }
-        return Ok(self.conn_state);
-    }
+    // pub fn write(&mut self, write_buffer: &mut [u8]) -> Result<WriteState> {
+    //     let conn = &mut self.tls.as_mut().unwrap().conn;
+    //     let mut bytes_written = 0;
+    //     if !self.write_submitted {
+    //         bytes_written = conn.writer().write(&write_buffer).unwrap();
 
-    pub fn write(&mut self, write_buffer: &mut [u8]) -> Result<WriteState> {
-        // let mut total_written = 0;
-        // let mut write_buf = vec![0u8; 16384];
-        let conn = &mut self.tls.as_mut().unwrap().conn;
+    //         match conn.write_tls(&mut &mut write_buffer[..]) {
+    //             Ok(0) => return Ok(WriteState::Written),
+    //             Ok(bytes_encrypted) => {
+    //                 let write_op = opcode::Write::new(
+    //                     Fd(self.sockfd.as_raw_fd()),
+    //                     write_buffer.as_ptr(),
+    //                     bytes_encrypted as _,
+    //                 )
+    //                 .build()
+    //                 .user_data(Box::into_raw(Box::new(OperationType::Write)) as u64);
+    //                 unsafe {
+    //                     self.ring
+    //                         .submission()
+    //                         .push(&write_op)
+    //                         .expect("submission queue is full");
+    //                 }
+    //                 self.write_submitted = true;
+    //                 self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+    //             }
+    //             Err(e) => return Err(ClientError::IO(e)),
+    //         }
+    //     }
 
-        if !self.write_submitted {
-            let bytes_written = conn.writer().write(&write_buffer).unwrap();
-            assert!(bytes_written == write_buffer.len()); // Im unsure how this occurs but certianly an error if it does.
+    //     match self.ring.completion().next() {
+    //         Some(cqe) => todo!(),
+    //         None => todo!(),
+    //     }
 
-            match conn.write_tls(&mut &mut write_buffer[..]) {
-                Ok(0) => return Ok(WriteState::Written),
-                Ok(bytes_encrypted) => {
-                    assert!(bytes_encrypted == write_buffer.len());
-                    let write_op = opcode::Write::new(
-                        Fd(self.sockfd.as_raw_fd()),
-                        write_buffer.as_ptr(),
-                        bytes_encrypted as _,
-                    )
-                    .build();
-                    unsafe {
-                        self.ring
-                            .submission()
-                            .push(&write_op)
-                            .expect("submission queue is full");
-                    }
-                    self.read_submitted = true;
-                    self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
-                }
-                Err(_) => todo!(),
-            }
-        }
+    //     match get_cqe_by_op(self.ring.completion(), OperationType::Write) {
+    //         Some(cqe) => {
+    //             let res = cqe.result();
+    //             if res >= 0 {
+    //                 let bytes_sent = res as usize;
+    //                 println!("sent: {} written: {}", bytes_sent, bytes_written);
+    //                 assert!(bytes_sent == bytes_written); // Im unsure how this occurs but certainly a bug if it does.
+    //                 return Ok(WriteState::Written);
+    //             } else {
+    //                 return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
+    //             }
+    //         }
+    //         None => return Ok(WriteState::WantsWrite),
+    //     }
+    // }
 
-        // No reads complete, early exit. Likely branch.
-        if self.ring.completion().len() == 0 {
-            return Ok(WriteState::WantsWrite);
-        } else {
-            let res = self.ring.completion().next().unwrap().result();
-            if res >= 0 {
-                let bytes_sent = res as usize;
-                assert!(bytes_sent == write_buffer.len()); // Im unsure how this occurs but certianly an error if it does.
-                return Ok(WriteState::Written);
-            } else {
-                return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
-            }
-        }
-    }
+    // /// Caller owns the read_buffer
+    // ///
+    // /// For performance reason, you may want to reuse buffer and set it to a "large enough" start size.
+    // pub fn read(&mut self, mut read_buffer: &mut Vec<u8>) -> Result<ReadState> {
+    //     // let mut tls_buffer = [0u8; 16384]; // Buffer for encrypted data
+    //     let conn = &mut self.tls.as_mut().unwrap().conn;
 
-    /// Caller owns the read_buffer
-    ///
-    /// For performance reason, you may want to reuse buffer and set it to a "large enough" start size.
-    pub fn read(&mut self, mut read_buffer: &mut Vec<u8>) -> Result<ReadState> {
-        // let mut tls_buffer = [0u8; 16384]; // Buffer for encrypted data
-        let conn = &mut self.tls.as_mut().unwrap().conn;
+    //     // Only check if we have submitted a read event
+    //     if self.read_submitted {
+    //         // println!("in first read");
 
-        // Only check if we have submitted a read event
-        if self.read_submitted {
-            // println!("in first read");
+    //         // Check for existing bytes from previous fn call
+    //         match conn.reader().read(read_buffer) {
+    //             Ok(0) => return Ok(ReadState::Disconnected),
+    //             Ok(count) => {
+    //                 // We have used up the read, make sure to issue next iteration
+    //                 self.read_submitted = false;
+    //                 return Ok(ReadState::Read(count));
+    //             }
+    //             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+    //                 self.read_submitted = false;
+    //                 return Ok(ReadState::WantsRead);
+    //             }
+    //             Err(e) => return Err(ClientError::IO(e)),
+    //         }
+    //     }
 
-            // Check for existing bytes from previous fn call
-            match conn.reader().read(read_buffer) {
-                Ok(0) => return Ok(ReadState::Disconnected),
-                Ok(count) => {
-                    // We have used up the read, make sure to issue next iteration
-                    self.read_submitted = false;
-                    return Ok(ReadState::Read(count));
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    self.read_submitted = false;
-                    return Ok(ReadState::WantsRead);
-                }
-                Err(e) => return Err(ClientError::IO(e)),
-            }
-        }
+    //     let read_op = opcode::Read::new(
+    //         Fd(self.sockfd.as_raw_fd()),
+    //         self.tls_buffer.as_mut_ptr(),
+    //         self.tls_buffer.len() as _,
+    //     )
+    //     .build()
+    //     .user_data(Box::into_raw(Box::new(OperationType::Read)) as u64);
+    //     unsafe {
+    //         self.ring
+    //             .submission()
+    //             .push(&read_op)
+    //             .expect("submission queue is full");
+    //     }
+    //     // Read event submitted, update state
+    //     self.read_submitted = true;
+    //     self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+    //     // println!("submit");
 
-        let read_op = opcode::Read::new(
-            Fd(self.sockfd.as_raw_fd()),
-            self.tls_buffer.as_mut_ptr(),
-            self.tls_buffer.len() as _,
-        )
-        .build();
-        unsafe {
-            self.ring
-                .submission()
-                .push(&read_op)
-                .expect("submission queue is full");
-        }
-        // Read event submitted, update state
-        self.read_submitted = true;
-        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
-        // println!("submit");
+    //     match get_cqe_by_op(self.ring.completion(), OperationType::Read) {
+    //         Some(cqe) => {
+    //             let res = cqe.result();
+    //             if res >= 0 {
+    //                 let bytes_read = res as usize;
+    //                 // Pass the encrypted data to rustls
+    //                 conn.read_tls(&mut &self.tls_buffer[..bytes_read])?;
+    //                 // println!("{}", bytes_read);
 
-        // No reads complete, early exit. Likely branch.
-        if self.ring.completion().len() == 0 {
-            // println!("len == 0");
-            return Ok(ReadState::WantsRead);
-        } else {
-            let cqe = self.ring.completion().next().unwrap();
-            let res = cqe.result();
-            if res < 0 {
-                return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
-            }
-            let bytes_read = res as usize;
-            // Pass the encrypted data to rustls
-            conn.read_tls(&mut &self.tls_buffer[..bytes_read])?;
-            // println!("{}", bytes_read);
+    //                 // Process the new packets
+    //                 match conn.process_new_packets() {
+    //                     Ok(io_state) => println!("Processed new packets: {:?}", io_state),
+    //                     Err(e) => return Err(ClientError::TLS(e)),
+    //                 }
 
-            // Process the new packets
-            match conn.process_new_packets() {
-                Ok(io_state) => println!("Processed new packets: {:?}", io_state),
-                Err(e) => return Err(ClientError::TLS(e)),
-            }
+    //                 // let mut total_decrypted = 0;
 
-            // let mut total_decrypted = 0;
-
-            // loop {
-            match conn.reader().read(&mut read_buffer) {
-                Ok(0) => return Ok(ReadState::Disconnected), // No more data
-                Ok(count) => {
-                    // total_decrypted += count;
-                    println!("Read {} bytes of decrypted data", count);
-                    // if total_decrypted == read_buffer.len() {
-                    // break; // Buffer is full
-                    // }
-                    self.read_submitted = false;
-                    return Ok(ReadState::Read(count));
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(ReadState::WantsRead),
-                Err(e) => return Err(ClientError::IO(e)),
-            }
-        }
-    }
+    //                 // loop {
+    //                 match conn.reader().read(&mut read_buffer) {
+    //                     Ok(0) => return Ok(ReadState::Disconnected), // No more data
+    //                     Ok(count) => {
+    //                         // total_decrypted += count;
+    //                         println!("Read {} bytes of decrypted data", count);
+    //                         // if total_decrypted == read_buffer.len() {
+    //                         // break; // Buffer is full
+    //                         // }
+    //                         self.read_submitted = false;
+    //                         return Ok(ReadState::Read(count));
+    //                     }
+    //                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
+    //                         return Ok(ReadState::WantsRead)
+    //                     }
+    //                     Err(e) => return Err(ClientError::IO(e)),
+    //                 }
+    //             } else {
+    //                 return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
+    //             }
+    //         }
+    //         None => return Ok(ReadState::WantsRead),
+    //     }
+    // }
 }
 
 // fn perform_non_blocking_tls_handshake(
