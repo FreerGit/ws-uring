@@ -1,6 +1,6 @@
 // #![feature(io_uring)]
 
-use ws_uring::client::{self, Client, ConnectState, ReadState};
+use ws_uring::client::{self, Client, ConnectState, ReadState, WriteState};
 
 use io_uring::squeue::Entry;
 use io_uring::types::Fd;
@@ -19,30 +19,41 @@ const BUFFER_SIZE: usize = 4096;
 
 fn main() -> io::Result<()> {
     let mut client = Client::new("https://www.example.com".to_owned()).unwrap();
-    let begin = std::time::Instant::now();
-    loop {
-        let state = client.connect();
-        if let Ok(ConnectState::Connected) = state {
-            break;
-        }
-    }
-    let end = std::time::Instant::now();
-    println!("{:?}", end - begin);
     {
-        let plaintext = b"GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n";
         let begin = std::time::Instant::now();
-        client.write(plaintext).unwrap();
+        loop {
+            let state = client.connect();
+            if let Ok(ConnectState::Connected) = state {
+                break;
+            }
+        }
         let end = std::time::Instant::now();
-        println!("{:?}", end - begin);
+        println!("Connecting took {:?}", end - begin);
     }
 
     {
-        println!("start reading");
-        let mut rb = vec![0u8; 1024 * 8];
         let begin = std::time::Instant::now();
+        let mut plaintext =
+            b"GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n".to_owned();
+        loop {
+            match client.write(&mut plaintext) {
+                Ok(WriteState::Disconnected) => todo!(),
+                Ok(WriteState::WantsWrite) => continue,
+                Ok(WriteState::Written) => {
+                    break;
+                }
+                Err(e) => println!("{:?}", e.to_string()),
+            }
+        }
+        let end = std::time::Instant::now();
+        println!("Writing took {:?}", end - begin);
+    }
+
+    {
+        let begin = std::time::Instant::now();
+        let mut rb = vec![0u8; 1024 * 8];
         loop {
             match client.read(&mut rb) {
-                Ok(ReadState::Idle) => continue,
                 Ok(ReadState::Disconnected) => todo!(),
                 Ok(ReadState::WantsRead) => continue,
                 Ok(ReadState::Read(n)) => {
@@ -53,7 +64,7 @@ fn main() -> io::Result<()> {
             }
         }
         let end = std::time::Instant::now();
-        println!("{:?}", end - begin);
+        println!("Reading took {:?}", end - begin);
     }
 
     // {

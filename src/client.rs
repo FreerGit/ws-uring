@@ -22,6 +22,7 @@ pub struct Client {
     sockfd: i32,
     conn_state: ConnectState,
     read_submitted: bool,
+    write_submitted: bool,
     tls: Option<TlsStream>,
     tls_buffer: Vec<u8>,
     // wb: Vec<u8>,
@@ -58,10 +59,16 @@ pub enum ConnectState {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ReadState {
-    Idle,
     Disconnected,
     WantsRead,
     Read(usize),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum WriteState {
+    Disconnected,
+    WantsWrite,
+    Written,
 }
 
 impl Client {
@@ -96,11 +103,12 @@ impl Client {
             ring: IoUring::new(32).unwrap(),
             conn_state: ConnectState::Idle,
             read_submitted: false,
+            write_submitted: false,
             addr,
             domain,
             tls: tls_ctx,
             sockfd,
-            tls_buffer: vec![0u8; 16384],
+            tls_buffer: vec![0u8; 16384], // TODO expose static size to user
         });
     }
 
@@ -244,56 +252,51 @@ impl Client {
         return Ok(self.conn_state);
     }
 
-    pub fn write(&mut self, plaintext: &[u8]) -> Result<()> {
-        let mut total_written = 0;
-        let mut write_buf = vec![0u8; 16384];
+    pub fn write(&mut self, write_buffer: &mut [u8]) -> Result<WriteState> {
+        // let mut total_written = 0;
+        // let mut write_buf = vec![0u8; 16384];
         let conn = &mut self.tls.as_mut().unwrap().conn;
 
-        while total_written < plaintext.len() {
-            // Write plaintext into the TLS connection
-            let bytes_processed = conn.writer().write(&plaintext[total_written..]).unwrap();
-            total_written += bytes_processed;
+        if !self.write_submitted {
+            let bytes_written = conn.writer().write(&write_buffer).unwrap();
+            assert!(bytes_written == write_buffer.len()); // Im unsure how this occurs but certianly an error if it does.
 
-            // Encrypt and send the data
-            loop {
-                match conn.write_tls(&mut &mut write_buf[..]) {
-                    Ok(0) => break, // No more data to write
-                    Ok(bytes_encrypted) => {
-                        let write_op = opcode::Write::new(
-                            Fd(self.sockfd.as_raw_fd()),
-                            write_buf.as_ptr(),
-                            bytes_encrypted as _,
-                        )
-                        .build();
-                        unsafe {
-                            self.ring
-                                .submission()
-                                .push(&write_op)
-                                .expect("submission queue is full");
-                        }
-                        self.ring.submit_and_wait(1).unwrap();
-
-                        let mut bytes_sent = 0;
-                        self.ring.completion().for_each(|cqe| {
-                            let res = cqe.result();
-                            if res >= 0 {
-                                bytes_sent = res as usize;
-                            } else {
-                                eprintln!("Write failed: {}", io::Error::from_raw_os_error(-res));
-                            }
-                        });
-
-                        if bytes_sent != bytes_encrypted {
-                            panic!("failed to write data");
-                        }
+            match conn.write_tls(&mut &mut write_buffer[..]) {
+                Ok(0) => return Ok(WriteState::Written),
+                Ok(bytes_encrypted) => {
+                    assert!(bytes_encrypted == write_buffer.len());
+                    let write_op = opcode::Write::new(
+                        Fd(self.sockfd.as_raw_fd()),
+                        write_buffer.as_ptr(),
+                        bytes_encrypted as _,
+                    )
+                    .build();
+                    unsafe {
+                        self.ring
+                            .submission()
+                            .push(&write_op)
+                            .expect("submission queue is full");
                     }
-                    // Err(rustls::Error::WantWrite) => continue,
-                    Err(e) => panic!("{}", format!("{:?}", e)),
+                    self.read_submitted = true;
+                    self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
                 }
+                Err(_) => todo!(),
             }
         }
 
-        Ok(())
+        // No reads complete, early exit. Likely branch.
+        if self.ring.completion().len() == 0 {
+            return Ok(WriteState::WantsWrite);
+        } else {
+            let res = self.ring.completion().next().unwrap().result();
+            if res >= 0 {
+                let bytes_sent = res as usize;
+                assert!(bytes_sent == write_buffer.len()); // Im unsure how this occurs but certianly an error if it does.
+                return Ok(WriteState::Written);
+            } else {
+                return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
+            }
+        }
     }
 
     /// Caller owns the read_buffer
