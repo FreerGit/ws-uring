@@ -1,5 +1,4 @@
 use std::{
-    borrow::Borrow,
     io::{self, ErrorKind, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     os::fd::{AsRawFd, FromRawFd},
@@ -20,7 +19,8 @@ pub struct Client {
     ring: IoUring,
     addr: OsSocketAddr,
     domain: String,
-    sockfd: i32,
+    // On issue_connect, we need to re-allocate socket and start over.
+    sockfd: Option<i32>,
     tls: Option<TlsStream>,
     tls_buffer: Vec<u8>, // TODO optional
 }
@@ -45,32 +45,41 @@ pub enum ClientError {
     ResolveHost,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum ConnectState {
-    Disconnected,
-    Connecting,
-    Connected,
-}
+// #[derive(Debug, PartialEq, Clone, Copy)]
+// pub enum ConnectState {
+//     Disconnected,
+//     Connecting,
+//     Connected,
+// }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum ReadState {
-    Disconnected,
-    WantsRead,
+pub enum State {
+    Idle,
     Read(usize),
+    Write,
+    Connect,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum WriteState {
-    Disconnected,
-    WantsWrite,
-    Written,
-}
+// #[derive(Debug, PartialEq, Clone, Copy)]
+// pub enum ReadState {
+//     Disconnected,
+//     WantsRead,
+//     Read(usize),
+// }
+
+// #[derive(Debug, PartialEq, Clone, Copy)]
+// pub enum WriteState {
+//     Disconnected,
+//     WantsWrite,
+//     Written,
+// }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum OperationType {
+enum Operation {
     Read,
     Write,
     Connect,
+    Close,
 }
 
 impl Client {
@@ -82,23 +91,23 @@ impl Client {
 
         let (addr, domain, server_name, port) = dns_lookup(url)?;
 
-        let sockfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
         let mut tls_ctx = None;
-        // TLS
-        if port == 443 {
-            let root_store = RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-            };
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
 
-            let config = Arc::new(config);
-            let tcp_stream = unsafe { TcpStream::from_raw_fd(sockfd) };
-            let conn = ClientConnection::new(config, server_name).unwrap();
-            let tls_stream = StreamOwned::new(conn, tcp_stream);
-            tls_ctx = Some(tls_stream)
-        }
+        // TLS
+        // if port == 443 {
+        //     let root_store = RootCertStore {
+        //         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        //     };
+        //     let config = rustls::ClientConfig::builder()
+        //         .with_root_certificates(root_store)
+        //         .with_no_client_auth();
+
+        //     let config = Arc::new(config);
+        //     let tcp_stream = unsafe { TcpStream::from_raw_fd(sockfd) };
+        //     let conn = ClientConnection::new(config, server_name).unwrap();
+        //     let tls_stream = StreamOwned::new(conn, tcp_stream);
+        //     tls_ctx = Some(tls_stream)
+        // }
 
         // TODO user definable `entries`?
         return Ok(Client {
@@ -106,9 +115,136 @@ impl Client {
             addr,
             domain,
             tls: tls_ctx,
-            sockfd,
+            sockfd: None,
             tls_buffer: vec![0u8; 16384], // TODO expose static size to user
         });
+    }
+
+    pub fn step(&mut self) -> Result<State> {
+        match self.ring.completion().next() {
+            Some(cqe) => {
+                let op = unsafe { Box::from_raw(cqe.user_data() as *mut Operation) };
+                let res = cqe.result();
+                // io::Error::from_raw_os_error(
+                //     io::Error::last_os_error().raw_os_error().unwrap()
+                // )
+                println!("{}, {:#?}", res, *op,);
+                if res < 0 {
+                    return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
+                }
+                match *op {
+                    // https://man7.org/linux/man-pages/man2/recv.2.html
+                    Operation::Read => Ok(State::Read(res as usize)),
+                    // https://man7.org/linux/man-pages/man2/write.2.html
+                    // TODO: There may be a case where fewer bytes than suggested is written
+                    Operation::Write => Ok(State::Write),
+                    Operation::Connect => Ok(State::Connect),
+                    Operation::Close => {
+                        return Ok(State::Idle);
+                    }
+                }
+            }
+            None => Ok(State::Idle),
+        }
+    }
+
+    pub fn issue_write(&mut self, bytes: &[u8]) -> Result<()> {
+        println!("issuing write with sockfd: {:?}", self.sockfd);
+        let write = opcode::Write::new(
+            Fd(self.sockfd.unwrap().as_raw_fd()),
+            bytes.as_ptr(),
+            bytes.len() as _,
+        )
+        .build()
+        .user_data(Box::into_raw(Box::new(Operation::Write)) as u64);
+        unsafe {
+            self.ring
+                .submission()
+                .push(&write)
+                .expect("submission queue is full");
+        }
+        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        Ok(())
+    }
+
+    pub fn issue_read(&mut self, buf: &mut [u8]) -> Result<()> {
+        println!("issuing read with sockfd: {:?}", self.sockfd);
+        let read = opcode::Recv::new(
+            Fd(self.sockfd.unwrap().as_raw_fd()),
+            buf.as_mut_ptr(),
+            buf.len() as _,
+        )
+        .build()
+        .user_data(Box::into_raw(Box::new(Operation::Read)) as u64);
+        unsafe {
+            self.ring
+                .submission()
+                .push(&read)
+                .expect("submission queue is full");
+        }
+        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        Ok(())
+    }
+
+    pub fn issue_connect(&mut self) -> Result<()> {
+        //
+        if self.sockfd.is_some() {
+            self.issue_close().unwrap();
+        }
+        let sockfd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::O_NONBLOCK,
+                libc::IPPROTO_TCP,
+            )
+        };
+        println!("{}", sockfd);
+        self.sockfd = Some(sockfd);
+
+        println!("issuing connect with sockfd: {:?}", self.sockfd);
+        let connect = opcode::Connect::new(
+            Fd(self.sockfd.unwrap().as_raw_fd()),
+            self.addr.as_ptr(),
+            self.addr.len(),
+        )
+        .build()
+        .user_data(Box::into_raw(Box::new(Operation::Connect)) as u64);
+        unsafe {
+            self.ring
+                .submission()
+                .push(&connect)
+                .expect("submission queue is full")
+        };
+        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        Ok(())
+    }
+
+    // Handled privately for now, perhaps expose to user??
+    fn issue_close(&mut self) -> Result<()> {
+        let close = opcode::Close::new(Fd(self.sockfd.unwrap().as_raw_fd()))
+            .build()
+            .user_data(Box::into_raw(Box::new(Operation::Close)) as u64);
+        unsafe {
+            self.ring
+                .submission()
+                .push(&close)
+                .expect("submission queue is full");
+        }
+        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        self.sockfd = None;
+        Ok(())
+    }
+
+    pub fn handle_write(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn handle_read(&mut self, buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn handle_connect(&mut self) -> Result<()> {
+        Ok(())
     }
 
     // TODO docs
