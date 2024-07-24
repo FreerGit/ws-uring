@@ -1,31 +1,27 @@
 use std::{
-    io::{self, ErrorKind, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
-    os::fd::{AsRawFd, FromRawFd},
-    sync::Arc,
+    io::{self, Bytes},
+    net::ToSocketAddrs,
+    os::fd::AsRawFd,
 };
 
 use io_uring::{
     opcode::{self},
     types::Fd,
-    CompletionQueue, IoUring,
+    IoUring,
 };
+use libc::user;
 use os_socketaddr::OsSocketAddr;
-use rustls::{pki_types::ServerName, ClientConnection, RootCertStore, StreamOwned};
 use thiserror::Error;
 use url::Url;
 
 pub struct Client {
     ring: IoUring,
     addr: OsSocketAddr,
-    domain: String,
     // On issue_connect, we need to re-allocate socket and start over.
     sockfd: Option<i32>,
-    tls: Option<TlsStream>,
-    tls_buffer: Vec<u8>, // TODO optional
+    // buffer: Vec<u8>, // buffer for uring to put bytes on
+    bump_index: usize,
 }
-
-type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
 type Result<T> = std::result::Result<T, ClientError>;
 
@@ -33,8 +29,6 @@ type Result<T> = std::result::Result<T, ClientError>;
 pub enum ClientError {
     #[error("{0}")]
     IO(#[from] io::Error),
-    #[error("{0}")]
-    TLS(#[from] rustls::Error),
     #[error("Client disconnected")]
     Disconnected,
     #[error("Invalid URL, could not parse")]
@@ -43,36 +37,16 @@ pub enum ClientError {
     NoHost,
     #[error("Failed to resolve host")]
     ResolveHost,
+    #[error("Out of Memory, message was larger than your buffer")]
+    OOM,
 }
 
-// #[derive(Debug, PartialEq, Clone, Copy)]
-// pub enum ConnectState {
-//     Disconnected,
-//     Connecting,
-//     Connected,
-// }
-
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq)]
 pub enum State {
     Idle,
     Read(usize),
-    Write,
     Connect,
 }
-
-// #[derive(Debug, PartialEq, Clone, Copy)]
-// pub enum ReadState {
-//     Disconnected,
-//     WantsRead,
-//     Read(usize),
-// }
-
-// #[derive(Debug, PartialEq, Clone, Copy)]
-// pub enum WriteState {
-//     Disconnected,
-//     WantsWrite,
-//     Written,
-// }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Operation {
@@ -84,64 +58,57 @@ enum Operation {
 
 impl Client {
     pub fn new(url: String) -> Result<Client> {
-        // let begin = std::time::Instant::now();
+        let (addr, port) = dns_lookup(url)?;
 
-        // let end = std::time::Instant::now();
-        // println!("{:?}", end - begin);
-
-        let (addr, domain, server_name, port) = dns_lookup(url)?;
-
-        let mut tls_ctx = None;
-
-        // TLS
-        // if port == 443 {
-        //     let root_store = RootCertStore {
-        //         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        //     };
-        //     let config = rustls::ClientConfig::builder()
-        //         .with_root_certificates(root_store)
-        //         .with_no_client_auth();
-
-        //     let config = Arc::new(config);
-        //     let tcp_stream = unsafe { TcpStream::from_raw_fd(sockfd) };
-        //     let conn = ClientConnection::new(config, server_name).unwrap();
-        //     let tls_stream = StreamOwned::new(conn, tcp_stream);
-        //     tls_ctx = Some(tls_stream)
-        // }
+        if port == 443 {
+            panic!("HTTPS is not supported");
+        }
 
         // TODO user definable `entries`?
         return Ok(Client {
             ring: IoUring::new(32).unwrap(),
             addr,
-            domain,
-            tls: tls_ctx,
             sockfd: None,
-            tls_buffer: vec![0u8; 16384], // TODO expose static size to user
+            // buffer: vec![0u8; 1024 * 64],
+            bump_index: 0,
         });
     }
 
-    pub fn step(&mut self) -> Result<State> {
-        match self.ring.completion().next() {
+    pub fn step(&mut self, user_buffer: &mut [u8]) -> Result<State> {
+        let next = self.ring.completion().next();
+        match next {
             Some(cqe) => {
                 let op = unsafe { Box::from_raw(cqe.user_data() as *mut Operation) };
                 let res = cqe.result();
-                // io::Error::from_raw_os_error(
-                //     io::Error::last_os_error().raw_os_error().unwrap()
-                // )
-                println!("{}, {:#?}", res, *op,);
+
+                println!("{}, {:#?}", res, *op);
                 if res < 0 {
                     return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
                 }
                 match *op {
                     // https://man7.org/linux/man-pages/man2/recv.2.html
-                    Operation::Read => Ok(State::Read(res as usize)),
-                    // https://man7.org/linux/man-pages/man2/write.2.html
-                    // TODO: There may be a case where fewer bytes than suggested is written
-                    Operation::Write => Ok(State::Write),
-                    Operation::Connect => Ok(State::Connect),
-                    Operation::Close => {
+                    Operation::Read => {
+                        if res == 0 {
+                            self.bump_index = 0;
+                            return Ok(State::Read(res as usize));
+                        }
+
+                        self.bump_index += res as usize;
+
+                        if user_buffer[..self.bump_index as usize].ends_with(b"\r\n\r\n") {
+                            let msg_len = self.bump_index;
+                            self.bump_index = 0;
+                            return Ok(State::Read(msg_len));
+                        }
+
+                        self.issue_read(user_buffer).unwrap();
                         return Ok(State::Idle);
                     }
+                    // https://man7.org/linux/man-pages/man2/write.2.html
+                    // TODO: There may be a case where fewer bytes than suggested is written
+                    Operation::Write => Ok(State::Idle),
+                    Operation::Connect => Ok(State::Connect),
+                    Operation::Close => Ok(State::Idle),
                 }
             }
             None => Ok(State::Idle),
@@ -167,12 +134,16 @@ impl Client {
         Ok(())
     }
 
-    pub fn issue_read(&mut self, buf: &mut [u8]) -> Result<()> {
+    pub fn issue_read(&mut self, rb: &mut [u8]) -> Result<()> {
+        if self.bump_index >= rb.len() {
+            return Err(ClientError::OOM);
+        }
+        assert!(rb.len() as i32 - self.bump_index as i32 >= 0);
         println!("issuing read with sockfd: {:?}", self.sockfd);
         let read = opcode::Recv::new(
             Fd(self.sockfd.unwrap().as_raw_fd()),
-            buf.as_mut_ptr(),
-            buf.len() as _,
+            rb[self.bump_index..].as_mut_ptr(),
+            (rb.len() - self.bump_index) as u32,
         )
         .build()
         .user_data(Box::into_raw(Box::new(Operation::Read)) as u64);
@@ -187,7 +158,6 @@ impl Client {
     }
 
     pub fn issue_connect(&mut self) -> Result<()> {
-        //
         if self.sockfd.is_some() {
             self.issue_close().unwrap();
         }
@@ -219,8 +189,7 @@ impl Client {
         Ok(())
     }
 
-    // Handled privately for now, perhaps expose to user??
-    fn issue_close(&mut self) -> Result<()> {
+    pub fn issue_close(&mut self) -> Result<()> {
         let close = opcode::Close::new(Fd(self.sockfd.unwrap().as_raw_fd()))
             .build()
             .user_data(Box::into_raw(Box::new(Operation::Close)) as u64);
@@ -234,271 +203,10 @@ impl Client {
         self.sockfd = None;
         Ok(())
     }
-
-    pub fn handle_write(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn handle_read(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn handle_connect(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    // TODO docs
-    // pub fn connect(&mut self) -> Result<ConnectState> {
-    //     // assert!(self.tls.is_some());
-
-    //     if !self.connect_submitted {
-    //         let prep_connect = opcode::Connect::new(
-    //             Fd(self.sockfd.as_raw_fd()),
-    //             self.addr.as_ptr(),
-    //             self.addr.len(),
-    //         );
-    //         unsafe {
-    //             self.ring
-    //                 .submission()
-    //                 .push(
-    //                     &prep_connect
-    //                         .build()
-    //                         .user_data(Box::into_raw(Box::new(OperationType::Connect)) as u64),
-    //                 )
-    //                 .expect("submission queue is full")
-    //         };
-    //         self.ring.submit().unwrap();
-    //         self.connect_submitted = true; // todo set false when connect is done.
-    //     }
-    //     let a = self.ring.completion().len();
-    //     println!("before {:?}", a);
-    //     match get_cqe_by_op(self.ring.completion(), OperationType::Connect) {
-    //         _ => {
-    //             if self.tls.is_none() {
-    //                 return Ok(ConnectState::Connected);
-    //             }
-    //         }
-    //     }
-    //     let b = self.ring.completion().len();
-    //     println!("after {:?}", b);
-    //     if a > 10 {
-    //         panic!();
-    //     }
-    //     // let conn = &self. .tls.as_ref().unwrap().conn;
-    //     // if !self.tls.as_ref().unwrap().conn.is_handshaking() {
-    //     //     return Ok(ConnectState::Connected);
-    //     // }
-
-    //     if self.tls.as_ref().unwrap().conn.wants_write() {
-    //         // println!("wants write");
-    //         let mut write_buffer = vec![0u8; 16384];
-    //         match self.write(&mut write_buffer) {
-    //             Ok(WriteState::Written) => {}
-    //             Ok(WriteState::WantsWrite) => {}
-    //             Ok(WriteState::Disconnected) => return Ok(ConnectState::Disconnected),
-    //             Err(e) => return Err(e),
-    //         }
-    //     }
-
-    //     if self.tls.as_ref().unwrap().conn.wants_read() {
-    //         // println!("wants read");
-
-    //         let mut read_buffer = vec![0u8; 16384];
-    //         match self.read(&mut read_buffer) {
-    //             Ok(ReadState::Read(_)) => {}
-    //             Ok(ReadState::WantsRead) => {}
-    //             Ok(ReadState::Disconnected) => return Ok(ConnectState::Disconnected),
-    //             Err(e) => return Err(e),
-    //         }
-    //     }
-    //     // TODO .next the connect cqe
-
-    //     return Ok(ConnectState::Connecting);
-    // }
-
-    // pub fn write(&mut self, write_buffer: &mut [u8]) -> Result<WriteState> {
-    //     let conn = &mut self.tls.as_mut().unwrap().conn;
-    //     let mut bytes_written = 0;
-    //     if !self.write_submitted {
-    //         bytes_written = conn.writer().write(&write_buffer).unwrap();
-
-    //         match conn.write_tls(&mut &mut write_buffer[..]) {
-    //             Ok(0) => return Ok(WriteState::Written),
-    //             Ok(bytes_encrypted) => {
-    //                 let write_op = opcode::Write::new(
-    //                     Fd(self.sockfd.as_raw_fd()),
-    //                     write_buffer.as_ptr(),
-    //                     bytes_encrypted as _,
-    //                 )
-    //                 .build()
-    //                 .user_data(Box::into_raw(Box::new(OperationType::Write)) as u64);
-    //                 unsafe {
-    //                     self.ring
-    //                         .submission()
-    //                         .push(&write_op)
-    //                         .expect("submission queue is full");
-    //                 }
-    //                 self.write_submitted = true;
-    //                 self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
-    //             }
-    //             Err(e) => return Err(ClientError::IO(e)),
-    //         }
-    //     }
-
-    //     match self.ring.completion().next() {
-    //         Some(cqe) => todo!(),
-    //         None => todo!(),
-    //     }
-
-    //     match get_cqe_by_op(self.ring.completion(), OperationType::Write) {
-    //         Some(cqe) => {
-    //             let res = cqe.result();
-    //             if res >= 0 {
-    //                 let bytes_sent = res as usize;
-    //                 println!("sent: {} written: {}", bytes_sent, bytes_written);
-    //                 assert!(bytes_sent == bytes_written); // Im unsure how this occurs but certainly a bug if it does.
-    //                 return Ok(WriteState::Written);
-    //             } else {
-    //                 return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
-    //             }
-    //         }
-    //         None => return Ok(WriteState::WantsWrite),
-    //     }
-    // }
-
-    // /// Caller owns the read_buffer
-    // ///
-    // /// For performance reason, you may want to reuse buffer and set it to a "large enough" start size.
-    // pub fn read(&mut self, mut read_buffer: &mut Vec<u8>) -> Result<ReadState> {
-    //     // let mut tls_buffer = [0u8; 16384]; // Buffer for encrypted data
-    //     let conn = &mut self.tls.as_mut().unwrap().conn;
-
-    //     // Only check if we have submitted a read event
-    //     if self.read_submitted {
-    //         // println!("in first read");
-
-    //         // Check for existing bytes from previous fn call
-    //         match conn.reader().read(read_buffer) {
-    //             Ok(0) => return Ok(ReadState::Disconnected),
-    //             Ok(count) => {
-    //                 // We have used up the read, make sure to issue next iteration
-    //                 self.read_submitted = false;
-    //                 return Ok(ReadState::Read(count));
-    //             }
-    //             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-    //                 self.read_submitted = false;
-    //                 return Ok(ReadState::WantsRead);
-    //             }
-    //             Err(e) => return Err(ClientError::IO(e)),
-    //         }
-    //     }
-
-    //     let read_op = opcode::Read::new(
-    //         Fd(self.sockfd.as_raw_fd()),
-    //         self.tls_buffer.as_mut_ptr(),
-    //         self.tls_buffer.len() as _,
-    //     )
-    //     .build()
-    //     .user_data(Box::into_raw(Box::new(OperationType::Read)) as u64);
-    //     unsafe {
-    //         self.ring
-    //             .submission()
-    //             .push(&read_op)
-    //             .expect("submission queue is full");
-    //     }
-    //     // Read event submitted, update state
-    //     self.read_submitted = true;
-    //     self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
-    //     // println!("submit");
-
-    //     match get_cqe_by_op(self.ring.completion(), OperationType::Read) {
-    //         Some(cqe) => {
-    //             let res = cqe.result();
-    //             if res >= 0 {
-    //                 let bytes_read = res as usize;
-    //                 // Pass the encrypted data to rustls
-    //                 conn.read_tls(&mut &self.tls_buffer[..bytes_read])?;
-    //                 // println!("{}", bytes_read);
-
-    //                 // Process the new packets
-    //                 match conn.process_new_packets() {
-    //                     Ok(io_state) => println!("Processed new packets: {:?}", io_state),
-    //                     Err(e) => return Err(ClientError::TLS(e)),
-    //                 }
-
-    //                 // let mut total_decrypted = 0;
-
-    //                 // loop {
-    //                 match conn.reader().read(&mut read_buffer) {
-    //                     Ok(0) => return Ok(ReadState::Disconnected), // No more data
-    //                     Ok(count) => {
-    //                         // total_decrypted += count;
-    //                         println!("Read {} bytes of decrypted data", count);
-    //                         // if total_decrypted == read_buffer.len() {
-    //                         // break; // Buffer is full
-    //                         // }
-    //                         self.read_submitted = false;
-    //                         return Ok(ReadState::Read(count));
-    //                     }
-    //                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
-    //                         return Ok(ReadState::WantsRead)
-    //                     }
-    //                     Err(e) => return Err(ClientError::IO(e)),
-    //                 }
-    //             } else {
-    //                 return Err(ClientError::IO(io::Error::from_raw_os_error(-res)));
-    //             }
-    //         }
-    //         None => return Ok(ReadState::WantsRead),
-    //     }
-    // }
 }
 
-// fn perform_non_blocking_tls_handshake(
-//     ring: &mut IoUring,
-//     mut conn: ClientConnection,
-//     stream: TcpStream,
-// ) -> io::Result<()> {
-//     // stream.set_nonblocking(true)?;
-//     let fd = Fd(stream.as_raw_fd());
-
-//     Ok(())
-// }
-
-// TODO docs
-// TODO test
-/// `dns_lookup(...)` is the only function that blocks, therefore it's seperate. You may cache the ip and use for later.
-/// This function makes sure that reconnects with `connect(...)` can be kept non-blocking.
-/// # Example
-/// ```
-/// use ws_uring::client::Client;
-/// // Supply domain name, not entire url!
-/// let client_1 = Client::new("example.com", true);
-/// assert!(client_1.dns_lookup(443).is_ok());
-/// // This will `fail`!
-/// let client_2 = Client::new("http://www.example.com", true);
-/// assert!(client_2.dns_lookup(443).is_err());
-/// ```
-// fn dns_lookup(domain: &str, port: u16) -> Result<OsSocketAddr> {
-//     let addr = (domain, port).to_socket_addrs();
-//     match addr {
-//         Ok(mut addr_iter) => {
-//             let first_addr = addr_iter
-//                 .next()
-//                 .ok_or(ClientError::DNSLookupError("No IPv4 found from DNS lookup"))?;
-//             let os_addr: OsSocketAddr = first_addr.into();
-//             println!("{:?}", first_addr.to_string());
-//             Ok(os_addr)
-//         }
-//         Err(_) => Err(ClientError::DNSLookupError("Invalid domain name")),
-//     }
-// }
-
-fn dns_lookup(url_str: String) -> Result<(OsSocketAddr, String, ServerName<'static>, u16)> {
-    // Parse the URL
+fn dns_lookup(url_str: String) -> Result<(OsSocketAddr, u16)> {
     let url = Url::parse(&url_str).or(Err(ClientError::InvalidUrl))?;
-
-    // 1. Lookup the IP to use for the socket
     let host = url.host_str().ok_or(ClientError::NoHost)?.to_string();
     let port = url
         .port()
@@ -512,33 +220,29 @@ fn dns_lookup(url_str: String) -> Result<(OsSocketAddr, String, ServerName<'stat
         .or(Err(ClientError::ResolveHost))?
         .next()
         .into();
-    // 2. Convert the URL to a domain name for the GET request
-    let domain = url.host_str().ok_or(ClientError::NoHost)?.to_string();
 
-    // 3. Convert the URL to a server name for ClientConnection::new
-    let server_name = ServerName::try_from(host.clone()).unwrap();
-
-    Ok((socket_addr, domain, server_name, port))
+    Ok((socket_addr, port))
 }
 
-// fn prep_connect
+#[cfg(test)]
+mod tests {
+    use crate::client::dns_lookup;
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+    #[test]
+    fn dns_lookup_success() {
+        assert!(dns_lookup("http://www.example.com".to_string()).is_ok());
+        assert!(dns_lookup("http://example.com".to_string()).is_ok());
+        assert!(dns_lookup("https://www.example.com".to_string()).is_ok());
+        assert!(dns_lookup("http://localhost".to_string()).is_ok());
 
-//     fn do_lookup(s: &'static str, port: u16) -> bool {
-//         let client = Client::new(s, false);
-//         client.dns_lookup(port).is_ok()
-//     }
+        let (_, port) = dns_lookup("http://localhost:8080".to_string()).unwrap();
+        assert!(port == 8080);
+    }
 
-//     #[test]
-//     fn dns_lookup() {
-//         assert!(do_lookup("example.com", 443));
-//         assert!(do_lookup("www.example.com", 443));
-//         assert!(!do_lookup("http://example.com", 443));
-//         assert!(!do_lookup("http://www.example.com", 443));
-//         assert!(!do_lookup("http://www.example.com", 80));
-//         assert!(!do_lookup("https://example.com", 443));
-//     }
-// }
+    #[test]
+    fn dns_lookup_fail() {
+        assert!(dns_lookup("".to_string()).is_err());
+        assert!(dns_lookup("example.com".to_string()).is_err());
+        assert!(dns_lookup("www.example.com".to_string()).is_err());
+    }
+}
