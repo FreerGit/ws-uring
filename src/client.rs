@@ -71,7 +71,7 @@ fn create_request(uri: &str) -> String {
         \r\nsec-websocket-version: 13\r\nsec-websocket-key: {}\r\n\r\n",
         uri, key
     );
-    return websocket_req;
+    websocket_req
 }
 
 impl Client {
@@ -83,14 +83,14 @@ impl Client {
         }
 
         // TODO user definable `entries`?
-        return Ok(Client {
+        Ok(Client {
             ring: IoUring::new(32).unwrap(),
             addr,
             host,
             sockfd: None,
             // buffer: vec![0u8; 1024 * 64],
             bump_index: 0,
-        });
+        })
     }
 
     pub fn step(&mut self, user_buffer: &mut [u8]) -> Result<State> {
@@ -117,7 +117,7 @@ impl Client {
                         let p = codec.decode(&mut payload).unwrap();
                         self.bump_index = 0;
 
-                        return Ok(State::Read(Some(p.unwrap())));
+                        Ok(State::Read(Some(p.unwrap())))
                     }
                     // https://man7.org/linux/man-pages/man2/write.2.html
                     // TODO: There may be a case where fewer bytes than suggested is written
@@ -125,7 +125,7 @@ impl Client {
                     Operation::Connect => {
                         let x = create_request(&self.host);
                         self.issue_handshake(user_buffer, x.as_bytes()).unwrap();
-                        return Ok(State::Idle);
+                        Ok(State::Idle)
                     }
                     Operation::Handshake => {
                         let mut headers = [httparse::EMPTY_HEADER; 16];
@@ -140,7 +140,7 @@ impl Client {
                         {
                             return Err(ClientError::Handshake("Switching protocol".to_string()));
                         }
-                        return Ok(State::Connect);
+                        Ok(State::Connect)
                     }
                     Operation::Close => Ok(State::Idle),
                 }
@@ -154,7 +154,7 @@ impl Client {
         let mut codec = MessageCodec::client();
         codec.encode(Message::text(bytes), &mut payload).unwrap();
         self.issue_write_underlying(&payload).unwrap();
-        return Ok(());
+        Ok(())
     }
 
     fn issue_write_underlying(&mut self, bytes: &[u8]) -> Result<()> {
@@ -171,7 +171,7 @@ impl Client {
                 .push(&write)
                 .expect("submission queue is full");
         }
-        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        self.ring.submit().map_err(ClientError::IO)?;
         Ok(())
     }
 
@@ -194,7 +194,7 @@ impl Client {
                 .push(&read)
                 .expect("submission queue is full");
         }
-        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        self.ring.submit().map_err(ClientError::IO)?;
         Ok(())
     }
 
@@ -224,7 +224,7 @@ impl Client {
                 .push(&connect)
                 .expect("submission queue is full")
         };
-        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        self.ring.submit().map_err(ClientError::IO)?;
         Ok(())
     }
 
@@ -238,7 +238,7 @@ impl Client {
                 .push(&close)
                 .expect("submission queue is full");
         }
-        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        self.ring.submit().map_err(ClientError::IO)?;
         self.sockfd = None;
         Ok(())
     }
@@ -264,7 +264,7 @@ impl Client {
                 .push(&read)
                 .expect("submission queue is full");
         }
-        self.ring.submit().or_else(|e| Err(ClientError::IO(e)))?;
+        self.ring.submit().map_err(ClientError::IO)?;
         Ok(())
     }
 }

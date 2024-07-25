@@ -1,7 +1,10 @@
-use std::io::{self};
+#![deny(clippy::perf)]
+#![warn(clippy::pedantic)]
+#![deny(clippy::bool_comparison)]
+
 use ws_uring::client::{Client, State};
 
-fn main() -> io::Result<()> {
+fn main() {
     // Note that the read buffer is owned by you, the caller. This means that if you do not use/copy
     // the bytes from said buffer before issuing a new read that memory will be overwritten eventually.
     let mut rb = vec![0u8; 1024 * 1000];
@@ -27,7 +30,7 @@ fn main() -> io::Result<()> {
                     // client.issue_connect().unwrap();
                 }
                 Ok(State::Read(Some(msg))) => {
-                    println!("Got message: {:?}", msg);
+                    println!("Got message: {msg:?}");
 
                     // You can check what the opcode of the message is and act accordingly
                     // match msg.opcode() {
@@ -57,5 +60,4 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    Ok(())
 }
