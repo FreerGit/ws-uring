@@ -1,6 +1,6 @@
 
 # Websocket client
-The client is non-blocking and it's modelled as a state machine using io_uring to handle IO without sys-calls. 
+The client is non-blocking and it's modelled as a state machine using io_uring to handle IO without sys-calls.
 
 ### Example
 A simple example is within [examples](/examples/main.rs), to run the example do:
